@@ -172,7 +172,23 @@ def _try_local_system_answer(user_input: str) -> str | None:
         path = text[3:].strip() or "."
         return _format_directory_listing(path)
 
-    if any(phrase in lowered for phrase in ("what time", "current time", "time is it")):
+    wants_time = (
+        any(
+            phrase in lowered
+            for phrase in (
+                "what time",
+                "what's the time",
+                "whats the time",
+                "current time",
+                "time is it",
+                "check the time",
+                "system time",
+                "local time",
+            )
+        )
+        or bool(re.search(r"\btime\s*(?:now|please)?\??$", lowered))
+    )
+    if wants_time:
         return f"The local time is {datetime.now().astimezone().isoformat(timespec='seconds')}."
 
     if any(phrase in lowered for phrase in ("system owner", "current user", "who owns this system", "who am i")):

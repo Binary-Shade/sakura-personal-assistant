@@ -466,7 +466,20 @@ class _WakeSampleMatcher:
 
     @property
     def ready(self) -> bool:
-        return len(self._positive) >= 3
+        allow_without_negatives = (
+            os.environ.get("SAKURA_WAKE_ALLOW_NO_NEGATIVES", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        has_negatives = len(self._negative) >= 3
+        return len(self._positive) >= 3 and (has_negatives or allow_without_negatives)
+
+    @property
+    def positive_count(self) -> int:
+        return len(self._positive)
+
+    @property
+    def negative_count(self) -> int:
+        return len(self._negative)
 
     def score_wav(self, audio: bytes) -> tuple[float, float | None, float]:
         candidate = self._embed_wav_bytes(audio)
@@ -580,6 +593,17 @@ def _wake_samples_match(console: Any, audio: bytes) -> bool:
         if _WAKE_SAMPLE_MATCHER is None:
             matcher = _WakeSampleMatcher(samples_dir)
             if not matcher.ready:
+                _warn_wake_once(
+                    console,
+                    "sample-matcher-needs-negatives",
+                    "Wake sample matcher needs at least 3 negative samples before "
+                    "it can run safely. Record them with: "
+                    "sakura wake record-samples --kind negative --count 75",
+                )
+                _wake_log(
+                    "sample_match_disabled "
+                    f"positive={matcher.positive_count} negative={matcher.negative_count}"
+                )
                 return False
             _WAKE_SAMPLE_MATCHER = matcher
         positive, negative, margin = _WAKE_SAMPLE_MATCHER.score_wav(audio)
