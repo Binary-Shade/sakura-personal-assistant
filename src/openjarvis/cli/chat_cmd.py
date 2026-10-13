@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+from datetime import datetime
 from typing import List, Optional
 
 import click
@@ -47,6 +49,43 @@ def _read_input(prompt: str = "You> ") -> Optional[str]:
         return input(prompt)
     except (EOFError, KeyboardInterrupt):
         return None
+
+
+def _time_greeting(now: datetime | None = None) -> str:
+    """Return a natural greeting for the local time of day."""
+    hour = (now or datetime.now()).hour
+    if 5 <= hour < 12:
+        return "Good morning"
+    if 12 <= hour < 17:
+        return "Good afternoon"
+    if 17 <= hour < 22:
+        return "Good evening"
+    return "Hello"
+
+
+def _startup_greeting(
+    *,
+    wake_mode: bool,
+    voice_mode: bool,
+    wake_phrase: str,
+) -> str:
+    """Build Sakura's short startup greeting."""
+    name = os.environ.get("SAKURA_USER_NAME", "").strip()
+    greeting = _time_greeting()
+    address = f", {name}" if name else ""
+    if wake_mode:
+        return (
+            f"{greeting}{address}. Sakura is awake in the background. "
+            f"Say {wake_phrase!r} when you need me."
+        )
+    if voice_mode:
+        return f"{greeting}{address}. Sakura voice mode is ready."
+    return f"{greeting}{address}. Sakura is ready."
+
+
+def _startup_greeting_enabled() -> bool:
+    value = os.environ.get("SAKURA_STARTUP_GREETING", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 async def _stream_voice_response(
@@ -385,7 +424,10 @@ def chat(
     # Keep voice state outside the core chat path so picker/runtime changes can
     # be layered independently. Loaded speech models live for this session.
     voice_session = VoiceSession(config) if voice_mode else None
-    if voice_session is not None:
+    speak_startup_greeting = (
+        voice_mode and voice_session is not None and _startup_greeting_enabled()
+    )
+    if voice_session is not None and not speak_startup_greeting:
         voice_session.prewarm_tts(console)
 
     # Print banner
@@ -410,6 +452,16 @@ def chat(
         f"{voice_hint}"
         f"  Type /help for commands, /quit to exit.\n",
     )
+
+    if _startup_greeting_enabled():
+        greeting = _startup_greeting(
+            wake_mode=wake_mode,
+            voice_mode=voice_mode,
+            wake_phrase=wake_phrase,
+        )
+        console.print(f"[cyan]{escape(greeting)}[/cyan]")
+        if speak_startup_greeting:
+            speak(greeting, console, voice_session)
 
     # Background-work status banner (disappears after first user message)
     from openjarvis.cli._bg_state import get_status
