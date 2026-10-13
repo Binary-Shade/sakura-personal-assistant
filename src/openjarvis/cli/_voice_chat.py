@@ -5,11 +5,13 @@ from __future__ import annotations
 import queue
 import re
 import threading
+import os
 from typing import Any, Optional
 
 from rich.markup import escape
 
 VOICE_EXIT = object()
+DEFAULT_WAKE_PHRASE = "hey sakura"
 
 # Backend selection is shared with the API server and lives in
 # openjarvis.speech._tts_discovery. Importing that at module level would pull
@@ -141,6 +143,157 @@ def read_voice_input(console: Any, session: VoiceSession) -> Optional[str] | obj
         return VOICE_EXIT
     typed = typed.strip()
     return typed if typed else record_voice(console, session)
+
+
+def read_wake_voice_input(
+    console: Any,
+    session: VoiceSession,
+    *,
+    wake_phrase: str = DEFAULT_WAKE_PHRASE,
+) -> Optional[str] | object:
+    """Wait for a wake phrase, then record and transcribe the user's command."""
+    try:
+        typed = input("You> [type, or Enter for wake mode] ")
+    except (EOFError, KeyboardInterrupt):
+        return VOICE_EXIT
+    typed = typed.strip()
+    if typed:
+        return typed
+    return listen_for_wake_phrase(console, session, wake_phrase=wake_phrase)
+
+
+def listen_for_wake_phrase(
+    console: Any,
+    session: VoiceSession,
+    *,
+    wake_phrase: str = DEFAULT_WAKE_PHRASE,
+) -> Optional[str] | object:
+    """Listen until the configured wake phrase is heard, then capture a turn."""
+    backend = session.get_stt_backend()
+    if backend is None:
+        console.print(
+            "[red]No speech-to-text backend available. Wake mode needs STT.[/red]"
+        )
+        return VOICE_EXIT
+
+    console.print(
+        f"[dim cyan]Wake mode: say '{_terminal_safe_text(wake_phrase)}'. "
+        "Press Ctrl-C to exit.[/dim cyan]"
+    )
+    try:
+        while True:
+            if _listen_with_openwakeword(console):
+                console.print("[dim cyan]Wake word detected. Listening…[/dim cyan]")
+                return record_voice(console, session)
+
+            wake_audio = _record_wake_candidate(console)
+            if wake_audio is None:
+                continue
+
+            try:
+                transcript = backend.transcribe(wake_audio, format="wav").text.strip()
+            except Exception as exc:
+                console.print(
+                    f"[dim yellow]Wake transcription error: "
+                    f"{_terminal_safe_text(exc)}[/dim yellow]"
+                )
+                continue
+
+            command = _command_after_wake_phrase(transcript, wake_phrase)
+            if command is None:
+                continue
+
+            console.print("[dim cyan]Wake word detected. Listening…[/dim cyan]")
+            if command:
+                console.print(
+                    f"[bold]You (voice):[/bold] {_terminal_safe_text(command)}"
+                )
+                return command
+            return record_voice(console, session)
+    except KeyboardInterrupt:
+        return VOICE_EXIT
+
+
+def _listen_with_openwakeword(console: Any) -> bool:
+    """Return True when a configured openWakeWord model fires.
+
+    Set ``SAKURA_WAKE_MODEL_PATH`` to a custom openWakeWord model for the
+    phrase "hey sakura". Without that model, the caller falls back to STT phrase
+    detection so wake mode still works during development.
+    """
+    model_path = os.environ.get("SAKURA_WAKE_MODEL_PATH", "").strip()
+    if not model_path:
+        return False
+
+    try:
+        import numpy as np
+        import sounddevice as sd
+        from openwakeword.model import Model
+    except ImportError as exc:
+        console.print(
+            "[dim yellow]openWakeWord is not installed; falling back to "
+            f"STT wake detection. Original error: {_terminal_safe_text(exc)}"
+            "[/dim yellow]"
+        )
+        return False
+
+    threshold = float(os.environ.get("SAKURA_WAKE_THRESHOLD", "0.55"))
+    frame_size = int(os.environ.get("SAKURA_WAKE_FRAME_SIZE", "1280"))
+    try:
+        model = Model(wakeword_models=[model_path])
+    except Exception as exc:
+        console.print(
+            "[dim yellow]Failed to load openWakeWord model; falling back to "
+            f"STT wake detection. Original error: {_terminal_safe_text(exc)}"
+            "[/dim yellow]"
+        )
+        return False
+
+    with sd.InputStream(
+        samplerate=16000,
+        channels=1,
+        dtype="int16",
+        blocksize=frame_size,
+    ) as stream:
+        while True:
+            audio, _ = stream.read(frame_size)
+            frame = np.asarray(audio).reshape(-1)
+            prediction = model.predict(frame)
+            score = max(float(value) for value in prediction.values())
+            if score >= threshold:
+                return True
+
+
+def _record_wake_candidate(console: Any) -> bytes | None:
+    from openjarvis.speech.voice_io import record_until_silence
+
+    try:
+        return record_until_silence(
+            silence_seconds=0.65,
+            startup_silence_seconds=60.0,
+            max_seconds=4.0,
+        )
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        console.print(f"[red]Mic error: {_terminal_safe_text(exc)}[/red]")
+        return None
+
+
+def _command_after_wake_phrase(
+    transcript: str,
+    wake_phrase: str,
+) -> str | None:
+    from openjarvis.speech.voice_io import normalize_wake_text
+
+    normalized = normalize_wake_text(transcript)
+    wake = normalize_wake_text(wake_phrase)
+    if not normalized or wake not in normalized:
+        return None
+
+    wake_end = normalized.find(wake) + len(wake)
+    remainder = normalized[wake_end:].strip()
+    return remainder
 
 
 def record_voice(
@@ -413,6 +566,9 @@ __all__ = [
     "SpeechChunker",
     "StreamingSpeaker",
     "VoiceSession",
+    "DEFAULT_WAKE_PHRASE",
+    "listen_for_wake_phrase",
+    "read_wake_voice_input",
     "read_voice_input",
     "record_voice",
     "speak",

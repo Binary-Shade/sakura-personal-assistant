@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import io
+import re
 import wave
+from typing import Protocol
 
 _SAMPLE_RATE = 16000
 _CHANNELS = 1
 _CHUNK = 1024
+_SILERO_CHUNK = 512
 _SILENCE_THRESHOLD = 500  # RMS below this → silence
-_SILENCE_SECONDS = 1.5  # seconds of silence before auto-stop
+_SILENCE_SECONDS = 0.9  # seconds of silence before auto-stop
 _STARTUP_SILENCE_SECONDS = 5.0  # give up early if speech never begins
 _MAX_RECORD_SECONDS = 30  # safety ceiling
+
+
+class _FrameVAD(Protocol):
+    def is_speech(self, data: bytes, sample_rate: int) -> bool:
+        """Return True when a PCM frame contains speech."""
 
 
 def _rms(data: bytes) -> float:
@@ -25,6 +33,64 @@ def _rms(data: bytes) -> float:
     return (sum(s * s for s in shorts) / n) ** 0.5
 
 
+class _SileroFrameVAD:
+    """Tiny frame-level wrapper around silero-vad when it is installed."""
+
+    def __init__(self, *, threshold: float = 0.5) -> None:
+        try:
+            import numpy as np
+            import torch
+            from silero_vad import load_silero_vad
+        except ImportError as exc:
+            raise RuntimeError(
+                "silero-vad is not installed. Install with: pip install silero-vad"
+            ) from exc
+
+        self._np = np
+        self._torch = torch
+        self._model = load_silero_vad()
+        self._threshold = threshold
+
+    def is_speech(self, data: bytes, sample_rate: int) -> bool:
+        audio = (
+            self._np.frombuffer(data, dtype=self._np.int16).astype(self._np.float32)
+            / 32768.0
+        )
+        with self._torch.no_grad():
+            probability = float(self._model(self._torch.from_numpy(audio), sample_rate))
+        return probability >= self._threshold
+
+
+class _RmsFrameVAD:
+    """Fallback VAD for systems without silero-vad."""
+
+    def __init__(self, *, threshold: int) -> None:
+        self._threshold = threshold
+
+    def is_speech(self, data: bytes, sample_rate: int) -> bool:
+        return _rms(data) > self._threshold
+
+
+def _get_frame_vad(
+    *,
+    mode: str,
+    silence_threshold: int,
+) -> _FrameVAD:
+    requested = mode.lower().strip()
+    if requested in ("auto", "silero"):
+        try:
+            return _SileroFrameVAD()
+        except RuntimeError:
+            if requested == "silero":
+                raise
+    return _RmsFrameVAD(threshold=silence_threshold)
+
+
+def normalize_wake_text(text: str) -> str:
+    """Normalize transcript text for wake-phrase matching."""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
 def record_until_silence(
     *,
     sample_rate: int = _SAMPLE_RATE,
@@ -32,8 +98,9 @@ def record_until_silence(
     silence_seconds: float = _SILENCE_SECONDS,
     startup_silence_seconds: float = _STARTUP_SILENCE_SECONDS,
     max_seconds: float = _MAX_RECORD_SECONDS,
+    vad: str = "auto",
 ) -> bytes:
-    """Record from the default microphone until silence is detected.
+    """Record from the default microphone until VAD-confirmed silence.
 
     Returns raw WAV bytes (16-bit mono).
     Raises RuntimeError if sounddevice is not installed.
@@ -46,7 +113,14 @@ def record_until_silence(
             "Install with: pip install sounddevice"
         )
 
-    chunks_per_second = sample_rate / _CHUNK
+    frame_vad = _get_frame_vad(mode=vad, silence_threshold=silence_threshold)
+
+    chunk_size = (
+        _SILERO_CHUNK
+        if isinstance(frame_vad, _SileroFrameVAD) and sample_rate == 16000
+        else _CHUNK
+    )
+    chunks_per_second = sample_rate / chunk_size
     silence_chunks = int(silence_seconds * chunks_per_second)
     startup_silence_chunks = max(1, int(startup_silence_seconds * chunks_per_second))
     max_chunks = int(max_seconds * chunks_per_second)
@@ -59,15 +133,14 @@ def record_until_silence(
         samplerate=sample_rate,
         channels=_CHANNELS,
         dtype="int16",
-        blocksize=_CHUNK,
+        blocksize=chunk_size,
     ) as stream:
         for _ in range(max_chunks):
-            raw, _ = stream.read(_CHUNK)
+            raw, _ = stream.read(chunk_size)
             data = bytes(raw)
             frames.append(data)
 
-            amplitude = _rms(data)
-            if amplitude > silence_threshold:
+            if frame_vad.is_speech(data, sample_rate):
                 has_speech = True
                 silence_count = 0
             elif not has_speech and len(frames) >= startup_silence_chunks:
@@ -123,4 +196,4 @@ def play_wav(audio: bytes, sample_rate: int = 24000) -> None:
     sd.wait()
 
 
-__all__ = ["play_wav", "record_until_silence"]
+__all__ = ["normalize_wake_text", "play_wav", "record_until_silence"]

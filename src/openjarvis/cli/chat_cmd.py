@@ -15,10 +15,12 @@ from rich.markup import escape
 from openjarvis.cli._runtime_panel import runtime_cli_options
 from openjarvis.cli._tool_names import resolve_tool_names
 from openjarvis.cli._voice_chat import (
+    DEFAULT_WAKE_PHRASE,
     VOICE_EXIT,
     SpeechChunker,
     StreamingSpeaker,
     VoiceSession,
+    listen_for_wake_phrase,
     read_voice_input,
     speak,
 )
@@ -138,6 +140,20 @@ def _can_stream_voice_response(agent: object | None) -> bool:
     default=False,
     help="Enable voice I/O: mic input with silence detection + TTS response playback.",
 )
+@click.option(
+    "--wake",
+    "wake_mode",
+    is_flag=True,
+    default=False,
+    help="Always-listening wake mode. Say 'hey sakura' to start a voice turn.",
+)
+@click.option(
+    "--wake-phrase",
+    "wake_phrase",
+    default=DEFAULT_WAKE_PHRASE,
+    show_default=True,
+    help="Wake phrase used by --wake.",
+)
 @runtime_cli_options
 def chat(
     engine_key: str | None,
@@ -148,6 +164,8 @@ def chat(
     system_prompt: str | None,
     persona_name: str | None,
     voice_mode: bool,
+    wake_mode: bool,
+    wake_phrase: str,
     num_ctx: int | None,
     num_gpu: int | None,
     skip_runtime_panel: bool,
@@ -170,6 +188,9 @@ def chat(
     Pass --voice to use microphone input (silence-detection) and hear responses
     read back via text-to-speech (kokoro local or OpenAI TTS).
     """
+    if wake_mode:
+        voice_mode = True
+
     console = Console(stderr=True)
 
     config = load_config()
@@ -355,7 +376,12 @@ def chat(
 
     # Print banner
     voice_hint = (
-        "  [magenta]Voice mode ON[/magenta] — type normally, or press Enter "
+        (
+            "  [magenta]Wake mode ON[/magenta] — say "
+            f"'{_safe_rich_label(wake_phrase)}' to speak; Ctrl-C exits.\n"
+        )
+        if wake_mode
+        else "  [magenta]Voice mode ON[/magenta] — type normally, or press Enter "
         "to speak; silence stops recording.\n"
         if voice_mode
         else ""
@@ -425,7 +451,20 @@ def chat(
         for note in _notifications.diff(get_status()):
             console.print(f"[dim cyan]{note}[/dim cyan]")
 
-        if voice_mode:
+        if wake_mode:
+            assert voice_session is not None
+            result = listen_for_wake_phrase(
+                console,
+                voice_session,
+                wake_phrase=wake_phrase,
+            )
+            if result is VOICE_EXIT:
+                console.print("\n[dim]Goodbye![/dim]")
+                break
+            if result is None:
+                continue
+            user_input = result
+        elif voice_mode:
             assert voice_session is not None
             result = read_voice_input(console, voice_session)
             if result is VOICE_EXIT:

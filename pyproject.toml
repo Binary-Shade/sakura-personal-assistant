@@ -109,6 +109,10 @@ voice = [
     "sounddevice>=0.5",  # play_wav / record_until_silence in speech/voice_io.py
     "numpy>=1.24",
 ]
+voice-wake = [
+    "openwakeword>=0.4",
+    "silero-vad>=5.1",
+]
 openhands = ["openhands-sdk>=1.0; python_version >= '3.12'"]
 # Apple Foundation Models (on-device AFM 3). Needs an Apple Silicon Mac on
 # macOS 26+ with Apple Intelligence enabled. The SDK compiles Swift bindings
@@ -172,6 +176,7 @@ speech = [
     "numpy>=1.24",
     "sounddevice>=0.5",
     "soundfile>=0.12",
+    "silero-vad>=5.1",
 ]
 speech-deepgram = ["deepgram-sdk>=3.0"]
 eval-wandb = ["wandb>=0.17"]
