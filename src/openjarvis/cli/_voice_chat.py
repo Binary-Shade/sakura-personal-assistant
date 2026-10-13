@@ -9,6 +9,7 @@ import queue
 import re
 import threading
 import os
+import wave
 from typing import Any, Optional
 
 from rich.markup import escape
@@ -18,6 +19,7 @@ DEFAULT_WAKE_PHRASE = "hey sakura"
 DEFAULT_WAKE_IDLE_TIMEOUT_SECONDS = 300.0
 _WAKE_DEBUG_ENV = "SAKURA_WAKE_DEBUG"
 _WAKE_WARNED: set[str] = set()
+_WAKE_SAMPLE_MATCHER: "_WakeSampleMatcher | None" = None
 
 # Backend selection is shared with the API server and lives in
 # openjarvis.speech._tts_discovery. Importing that at module level would pull
@@ -209,6 +211,10 @@ def listen_for_wake_phrase(
             if wake_audio is None:
                 continue
 
+            if _wake_samples_match(console, wake_audio):
+                console.print("[dim cyan]Wake word detected. Listening…[/dim cyan]")
+                return record_voice(console, session)
+
             try:
                 result = backend.transcribe(
                     wake_audio,
@@ -254,6 +260,8 @@ def _wake_engine_enabled(engine_name: str) -> bool:
     configured = os.environ.get("SAKURA_WAKE_ENGINE", "auto").strip().lower()
     if engine_name == "porcupine":
         return configured == "porcupine"
+    if engine_name == "samples":
+        return configured in ("", "auto", "samples")
     return configured in ("", "auto", engine_name)
 
 
@@ -442,6 +450,159 @@ def _record_wake_candidate(console: Any) -> bytes | None:
     except Exception as exc:
         console.print(f"[red]Mic error: {_terminal_safe_text(exc)}[/red]")
         return None
+
+
+class _WakeSampleMatcher:
+    """Query-by-example wake matcher using the user's recorded samples."""
+
+    def __init__(self, samples_dir: Path) -> None:
+        import numpy as np
+        from openwakeword.utils import AudioFeatures
+
+        self._np = np
+        self._features = AudioFeatures()
+        self._positive = self._load_templates(samples_dir / "positive")
+        self._negative = self._load_templates(samples_dir / "negative")
+
+    @property
+    def ready(self) -> bool:
+        return len(self._positive) >= 3
+
+    def score_wav(self, audio: bytes) -> tuple[float, float | None, float]:
+        candidate = self._embed_wav_bytes(audio)
+        return self.score_embedding(candidate)
+
+    def score_path(self, path: Path, *, exclude_self: bool = False) -> tuple[float, float | None, float]:
+        candidate = self._embed_wav_file(path)
+        return self.score_embedding(
+            candidate,
+            exclude_path=path if exclude_self else None,
+        )
+
+    def score_embedding(
+        self,
+        candidate: object,
+        *,
+        exclude_path: Path | None = None,
+    ) -> tuple[float, float | None, float]:
+        positives = [
+            template
+            for path, template in self._positive
+            if exclude_path is None or path != exclude_path
+        ]
+        if not positives:
+            positives = [template for _, template in self._positive]
+        positive_score = max(
+            self._sequence_similarity(candidate, template)
+            for template in positives
+        )
+        negative_score = (
+            max(
+                self._sequence_similarity(candidate, template)
+                for _, template in self._negative
+            )
+            if self._negative
+            else None
+        )
+        margin = (
+            positive_score - negative_score
+            if negative_score is not None
+            else positive_score
+        )
+        return positive_score, negative_score, margin
+
+    def _load_templates(self, directory: Path) -> list[object]:
+        templates = []
+        if not directory.exists():
+            return templates
+        for path in sorted(directory.glob("*.wav")):
+            try:
+                templates.append((path, self._embed_wav_file(path)))
+            except Exception:
+                _wake_log(f"sample_load_failed path={path}")
+        return templates
+
+    def _embed_wav_file(self, path: Path) -> object:
+        with wave.open(str(path), "rb") as handle:
+            audio = self._np.frombuffer(
+                handle.readframes(handle.getnframes()),
+                dtype=self._np.int16,
+            )
+        return self._embed_pcm(audio)
+
+    def _embed_wav_bytes(self, audio: bytes) -> object:
+        import io
+
+        with wave.open(io.BytesIO(audio), "rb") as handle:
+            pcm = self._np.frombuffer(
+                handle.readframes(handle.getnframes()),
+                dtype=self._np.int16,
+            )
+        return self._embed_pcm(pcm)
+
+    def _embed_pcm(self, pcm: object) -> object:
+        embeddings = self._features._get_embeddings(pcm)
+        if embeddings.ndim == 1:
+            embeddings = embeddings[None, :]
+        norms = self._np.linalg.norm(embeddings, axis=1, keepdims=True)
+        return embeddings / self._np.maximum(norms, 1e-8)
+
+    def _sequence_similarity(self, left: object, right: object) -> float:
+        # Dynamic-time-warping over cosine distance. Clips can differ in speed
+        # and length, so sequence alignment is more reliable than a flat mean.
+        n, m = left.shape[0], right.shape[0]
+        costs = 1.0 - self._np.clip(left @ right.T, -1.0, 1.0)
+        dp = self._np.full((n + 1, m + 1), self._np.inf, dtype=self._np.float32)
+        dp[0, 0] = 0.0
+        for row in range(1, n + 1):
+            for col in range(1, m + 1):
+                dp[row, col] = costs[row - 1, col - 1] + min(
+                    dp[row - 1, col],
+                    dp[row, col - 1],
+                    dp[row - 1, col - 1],
+                )
+        path_len = max(n, m)
+        return float(1.0 - (dp[n, m] / path_len))
+
+
+def _wake_samples_match(console: Any, audio: bytes) -> bool:
+    if not _wake_engine_enabled("samples"):
+        return False
+
+    global _WAKE_SAMPLE_MATCHER
+    samples_dir = Path(
+        os.environ.get(
+            "SAKURA_WAKE_SAMPLES_DIR",
+            str(Path.home() / ".openjarvis" / "wake_samples"),
+        )
+    )
+    try:
+        if _WAKE_SAMPLE_MATCHER is None:
+            matcher = _WakeSampleMatcher(samples_dir)
+            if not matcher.ready:
+                return False
+            _WAKE_SAMPLE_MATCHER = matcher
+        positive, negative, margin = _WAKE_SAMPLE_MATCHER.score_wav(audio)
+    except Exception as exc:
+        _warn_wake_once(
+            console,
+            "sample-matcher",
+            "Wake sample matcher is unavailable; falling back to STT wake "
+            f"detection. Original error: {_terminal_safe_text(exc)}",
+        )
+        return False
+
+    threshold = float(os.environ.get("SAKURA_WAKE_SAMPLE_THRESHOLD", "0.82"))
+    min_margin = float(os.environ.get("SAKURA_WAKE_SAMPLE_MARGIN", "0.03"))
+    matched = positive >= threshold and margin >= min_margin
+    if os.environ.get(_WAKE_DEBUG_ENV) == "1" or matched:
+        _wake_log(
+            f"sample_match positive={positive:.3f} "
+            f"negative={negative if negative is not None else 'none'} "
+            f"margin={margin:.3f} threshold={threshold:.3f} "
+            f"min_margin={min_margin:.3f} matched={matched}"
+        )
+    return matched
 
 
 def _command_after_wake_phrase(

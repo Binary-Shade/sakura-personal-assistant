@@ -74,6 +74,15 @@ export SAKURA_WAKE_THRESHOLD=0.42
 sakura chat --wake --wake-phrase "hey sakura"
 ```
 
+If you do not have a trained ONNX model yet, Sakura can use your local
+recordings directly:
+
+```bash
+export SAKURA_WAKE_ENGINE=samples
+export SAKURA_WAKE_SAMPLE_THRESHOLD=0.82
+sakura chat --wake --wake-phrase "hey sakura"
+```
+
 To tune detection, enable wake debug logs and inspect scores:
 
 ```bash
@@ -90,6 +99,7 @@ To build a custom training set, record both positive and negative clips:
 ```bash
 sakura wake record-samples --kind positive --count 75 --phrase "hey sakura"
 sakura wake record-samples --kind negative --count 75
+sakura wake analyze-samples
 ```
 
 Samples are saved under `~/.openjarvis/wake_samples/` for openWakeWord
