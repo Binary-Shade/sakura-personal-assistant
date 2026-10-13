@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import re
+import threading
 import wave
 from typing import Protocol
 
@@ -15,6 +16,8 @@ _SILENCE_THRESHOLD = 500  # RMS below this → silence
 _SILENCE_SECONDS = 0.9  # seconds of silence before auto-stop
 _STARTUP_SILENCE_SECONDS = 5.0  # give up early if speech never begins
 _MAX_RECORD_SECONDS = 30  # safety ceiling
+_CACHED_SILERO_VAD: _FrameVAD | None = None
+_CACHED_SILERO_LOCK = threading.Lock()
 
 
 class _FrameVAD(Protocol):
@@ -79,7 +82,11 @@ def _get_frame_vad(
     requested = mode.lower().strip()
     if requested in ("auto", "silero"):
         try:
-            return _SileroFrameVAD()
+            global _CACHED_SILERO_VAD
+            with _CACHED_SILERO_LOCK:
+                if _CACHED_SILERO_VAD is None:
+                    _CACHED_SILERO_VAD = _SileroFrameVAD()
+                return _CACHED_SILERO_VAD
         except RuntimeError:
             if requested == "silero":
                 raise

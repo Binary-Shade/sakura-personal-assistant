@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from difflib import SequenceMatcher
+from pathlib import Path
 import queue
 import re
 import threading
@@ -12,6 +15,7 @@ from rich.markup import escape
 
 VOICE_EXIT = object()
 DEFAULT_WAKE_PHRASE = "hey sakura"
+_WAKE_DEBUG_ENV = "SAKURA_WAKE_DEBUG"
 
 # Backend selection is shared with the API server and lives in
 # openjarvis.speech._tts_discovery. Importing that at module level would pull
@@ -197,9 +201,17 @@ def listen_for_wake_phrase(
                     f"[dim yellow]Wake transcription error: "
                     f"{_terminal_safe_text(exc)}[/dim yellow]"
                 )
+                _wake_log(f"transcription_error: {exc}")
                 continue
 
             command = _command_after_wake_phrase(transcript, wake_phrase)
+            _wake_log(f"heard={transcript!r} matched={command is not None}")
+            if os.environ.get(_WAKE_DEBUG_ENV) == "1":
+                status = "matched" if command is not None else "ignored"
+                console.print(
+                    f"[dim]Wake debug ({status}): "
+                    f"{_terminal_safe_text(transcript or '<empty>')}[/dim]"
+                )
             if command is None:
                 continue
 
@@ -240,7 +252,7 @@ def _listen_with_openwakeword(console: Any) -> bool:
     threshold = float(os.environ.get("SAKURA_WAKE_THRESHOLD", "0.55"))
     frame_size = int(os.environ.get("SAKURA_WAKE_FRAME_SIZE", "1280"))
     try:
-        model = Model(wakeword_models=[model_path])
+        model = Model(wakeword_model_paths=[model_path])
     except Exception as exc:
         console.print(
             "[dim yellow]Failed to load openWakeWord model; falling back to "
@@ -289,11 +301,64 @@ def _command_after_wake_phrase(
     normalized = normalize_wake_text(transcript)
     wake = normalize_wake_text(wake_phrase)
     if not normalized or wake not in normalized:
-        return None
+        return _fuzzy_command_after_wake_phrase(normalized, wake)
 
     wake_end = normalized.find(wake) + len(wake)
     remainder = normalized[wake_end:].strip()
     return remainder
+
+
+def _fuzzy_command_after_wake_phrase(
+    normalized: str,
+    wake: str,
+) -> str | None:
+    tokens = normalized.split()
+    wake_tokens = wake.split()
+    if not tokens or not wake_tokens:
+        return None
+
+    target_name = wake_tokens[-1]
+    greeting_tokens = {"hey", "hi", "hello", "okay", "ok"}
+    variants = {
+        target_name,
+        "sakura",
+        "sakra",
+        "sacura",
+        "shakura",
+        "sakhura",
+        "sakuraa",
+    }
+
+    for index, token in enumerate(tokens):
+        name_score = max(
+            SequenceMatcher(None, token, variant).ratio() for variant in variants
+        )
+        previous = tokens[index - 1] if index > 0 else ""
+        has_greeting = previous in greeting_tokens
+        starts_with_name = index == 0 and name_score >= 0.82
+        greeted_name = has_greeting and name_score >= 0.70
+        if starts_with_name or greeted_name:
+            return " ".join(tokens[index + 1 :]).strip()
+
+    # Very short wake-only attempts are often transcribed as just the assistant
+    # name. Accept those so Sakura moves into command capture instead of
+    # silently ignoring the user.
+    if len(tokens) <= 3:
+        for token in tokens:
+            if SequenceMatcher(None, token, target_name).ratio() >= 0.82:
+                return ""
+    return None
+
+
+def _wake_log(message: str) -> None:
+    try:
+        path = Path.home() / ".openjarvis" / ".state" / "wake.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} {message}\n")
+    except Exception:
+        pass
 
 
 def record_voice(
