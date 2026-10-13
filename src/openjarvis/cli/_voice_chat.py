@@ -15,6 +15,7 @@ from rich.markup import escape
 
 VOICE_EXIT = object()
 DEFAULT_WAKE_PHRASE = "hey sakura"
+DEFAULT_WAKE_IDLE_TIMEOUT_SECONDS = 300.0
 _WAKE_DEBUG_ENV = "SAKURA_WAKE_DEBUG"
 
 # Backend selection is shared with the API server and lives in
@@ -416,9 +417,12 @@ def _wake_log(message: str) -> None:
 def record_voice(
     console: Any,
     session: VoiceSession | None = None,
+    *,
+    startup_silence_seconds: float | None = None,
+    listening_label: str | None = None,
 ) -> Optional[str] | object:
     """Record from mic, transcribe, and return text or a loop sentinel."""
-    from openjarvis.speech.voice_io import record_until_silence
+    from openjarvis.speech.voice_io import record_until_silence, wav_duration_seconds
 
     active_session = session or VoiceSession()
     backend = active_session.get_stt_backend()
@@ -431,9 +435,16 @@ def record_voice(
         )
         return VOICE_EXIT
 
-    console.print("[dim cyan]Listening… (speak now, stops on silence)[/dim cyan]")
+    label = listening_label or "Listening… (speak now, stops on silence)"
+    console.print(f"[dim cyan]{label}[/dim cyan]")
     try:
-        audio_bytes = record_until_silence()
+        record_kwargs: dict[str, float] = {}
+        if startup_silence_seconds is not None:
+            record_kwargs["startup_silence_seconds"] = startup_silence_seconds
+        audio_bytes = record_until_silence(**record_kwargs)
+        if wav_duration_seconds(audio_bytes) <= 0:
+            console.print("[dim]Nothing heard — try again.[/dim]")
+            return None
     except KeyboardInterrupt:
         return VOICE_EXIT
     except Exception as exc:
@@ -688,6 +699,7 @@ __all__ = [
     "StreamingSpeaker",
     "VoiceSession",
     "DEFAULT_WAKE_PHRASE",
+    "DEFAULT_WAKE_IDLE_TIMEOUT_SECONDS",
     "listen_for_wake_phrase",
     "read_wake_voice_input",
     "read_voice_input",

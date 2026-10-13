@@ -16,12 +16,14 @@ from openjarvis.cli._runtime_panel import runtime_cli_options
 from openjarvis.cli._tool_names import resolve_tool_names
 from openjarvis.cli._voice_chat import (
     DEFAULT_WAKE_PHRASE,
+    DEFAULT_WAKE_IDLE_TIMEOUT_SECONDS,
     VOICE_EXIT,
     SpeechChunker,
     StreamingSpeaker,
     VoiceSession,
     listen_for_wake_phrase,
     read_voice_input,
+    record_voice,
     speak,
 )
 from openjarvis.core.config import load_config
@@ -154,6 +156,17 @@ def _can_stream_voice_response(agent: object | None) -> bool:
     show_default=True,
     help="Wake phrase used by --wake.",
 )
+@click.option(
+    "--wake-idle-timeout",
+    "wake_idle_timeout",
+    default=DEFAULT_WAKE_IDLE_TIMEOUT_SECONDS,
+    show_default=True,
+    type=float,
+    help=(
+        "Seconds Sakura keeps listening for follow-up replies after waking. "
+        "After this much silence, wake mode goes quiet again."
+    ),
+)
 @runtime_cli_options
 def chat(
     engine_key: str | None,
@@ -166,6 +179,7 @@ def chat(
     voice_mode: bool,
     wake_mode: bool,
     wake_phrase: str,
+    wake_idle_timeout: float,
     num_ctx: int | None,
     num_gpu: int | None,
     skip_runtime_panel: bool,
@@ -378,7 +392,8 @@ def chat(
     voice_hint = (
         (
             "  [magenta]Wake mode ON[/magenta] — say "
-            f"'{_safe_rich_label(wake_phrase)}' to speak; Ctrl-C exits.\n"
+            f"'{_safe_rich_label(wake_phrase)}' to speak; "
+            f"stays active for {int(wake_idle_timeout)}s of silence.\n"
         )
         if wake_mode
         else "  [magenta]Voice mode ON[/magenta] — type normally, or press Enter "
@@ -447,22 +462,41 @@ def chat(
         history.append(Message(role=Role.SYSTEM, content=system_prompt))
 
     # REPL loop
+    wake_conversation_active = False
     while True:
         for note in _notifications.diff(get_status()):
             console.print(f"[dim cyan]{note}[/dim cyan]")
 
         if wake_mode:
             assert voice_session is not None
-            result = listen_for_wake_phrase(
-                console,
-                voice_session,
-                wake_phrase=wake_phrase,
-            )
+            if wake_conversation_active:
+                result = record_voice(
+                    console,
+                    voice_session,
+                    startup_silence_seconds=wake_idle_timeout,
+                    listening_label=(
+                        "Listening for your reply… "
+                        f"({int(wake_idle_timeout)}s silence returns to wake mode)"
+                    ),
+                )
+                if result is None:
+                    wake_conversation_active = False
+                    console.print(
+                        "[dim cyan]No reply heard — returning to wake mode.[/dim cyan]"
+                    )
+                    continue
+            else:
+                result = listen_for_wake_phrase(
+                    console,
+                    voice_session,
+                    wake_phrase=wake_phrase,
+                )
             if result is VOICE_EXIT:
                 console.print("\n[dim]Goodbye![/dim]")
                 break
             if result is None:
                 continue
+            wake_conversation_active = True
             user_input = result
         elif voice_mode:
             assert voice_session is not None

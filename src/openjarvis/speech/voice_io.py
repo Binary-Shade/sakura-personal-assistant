@@ -176,6 +176,8 @@ def record_until_silence(
                 if silence_count >= silence_chunks:
                     break
 
+    if not has_speech:
+        return _frames_to_wav([], sample_rate)
     return _frames_to_wav(frames, sample_rate)
 
 
