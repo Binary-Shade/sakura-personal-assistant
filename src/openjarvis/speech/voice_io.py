@@ -36,6 +36,25 @@ def _rms(data: bytes) -> float:
     return (sum(s * s for s in shorts) / n) ** 0.5
 
 
+def wav_rms(audio: bytes) -> float:
+    """Return RMS amplitude for a WAV byte string."""
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wf:
+            return _rms(wf.readframes(wf.getnframes()))
+    except Exception:
+        return _rms(audio)
+
+
+def wav_duration_seconds(audio: bytes) -> float:
+    """Return duration for a WAV byte string."""
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wf:
+            rate = wf.getframerate() or _SAMPLE_RATE
+            return wf.getnframes() / rate
+    except Exception:
+        return 0.0
+
+
 class _SileroFrameVAD:
     """Tiny frame-level wrapper around silero-vad when it is installed."""
 
@@ -203,4 +222,10 @@ def play_wav(audio: bytes, sample_rate: int = 24000) -> None:
     sd.wait()
 
 
-__all__ = ["normalize_wake_text", "play_wav", "record_until_silence"]
+__all__ = [
+    "normalize_wake_text",
+    "play_wav",
+    "record_until_silence",
+    "wav_duration_seconds",
+    "wav_rms",
+]

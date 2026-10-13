@@ -195,7 +195,8 @@ def listen_for_wake_phrase(
                 continue
 
             try:
-                transcript = backend.transcribe(wake_audio, format="wav").text.strip()
+                result = backend.transcribe(wake_audio, format="wav", language="en")
+                transcript = result.text.strip()
             except Exception as exc:
                 console.print(
                     f"[dim yellow]Wake transcription error: "
@@ -205,7 +206,11 @@ def listen_for_wake_phrase(
                 continue
 
             command = _command_after_wake_phrase(transcript, wake_phrase)
-            _wake_log(f"heard={transcript!r} matched={command is not None}")
+            _wake_log(
+                f"heard={transcript!r} lang={getattr(result, 'language', None)!r} "
+                f"conf={getattr(result, 'confidence', None)!r} "
+                f"matched={command is not None}"
+            )
             if os.environ.get(_WAKE_DEBUG_ENV) == "1":
                 status = "matched" if command is not None else "ignored"
                 console.print(
@@ -277,14 +282,24 @@ def _listen_with_openwakeword(console: Any) -> bool:
 
 
 def _record_wake_candidate(console: Any) -> bytes | None:
-    from openjarvis.speech.voice_io import record_until_silence
+    from openjarvis.speech.voice_io import (
+        record_until_silence,
+        wav_duration_seconds,
+        wav_rms,
+    )
 
     try:
-        return record_until_silence(
+        audio = record_until_silence(
             silence_seconds=0.65,
-            startup_silence_seconds=60.0,
-            max_seconds=4.0,
+            startup_silence_seconds=30.0,
+            max_seconds=3.2,
         )
+        duration = wav_duration_seconds(audio)
+        rms = wav_rms(audio)
+        if duration < 0.35 or rms < 80:
+            _wake_log(f"skipped_audio duration={duration:.2f} rms={rms:.1f}")
+            return None
+        return audio
     except KeyboardInterrupt:
         raise
     except Exception as exc:
@@ -323,11 +338,35 @@ def _fuzzy_command_after_wake_phrase(
         target_name,
         "sakura",
         "sakra",
+        "sacra",
         "sacura",
+        "sakura",
+        "saccura",
+        "sakkura",
+        "sakura",
         "shakura",
         "sakhura",
         "sakuraa",
+        "sabura",
+        "sabra",
+        "sakula",
+        "sacula",
+        "sanggura",
+        "sangura",
+        "sankura",
     }
+
+    joined = " ".join(tokens)
+    joined_compact = "".join(tokens)
+    compact_variants = {variant.replace(" ", "") for variant in variants}
+    for variant in compact_variants:
+        if variant and variant in joined_compact:
+            start = joined_compact.find(variant) + len(variant)
+            # If matching a compacted phrase like "sakulasearch", the original
+            # token positions are ambiguous. Wake-only still moves into command
+            # capture; otherwise the normal token loop below extracts commands.
+            if start >= len(joined_compact) - 2 or len(tokens) <= 4:
+                return ""
 
     for index, token in enumerate(tokens):
         name_score = max(
@@ -335,8 +374,8 @@ def _fuzzy_command_after_wake_phrase(
         )
         previous = tokens[index - 1] if index > 0 else ""
         has_greeting = previous in greeting_tokens
-        starts_with_name = index == 0 and name_score >= 0.82
-        greeted_name = has_greeting and name_score >= 0.70
+        starts_with_name = index == 0 and name_score >= 0.72
+        greeted_name = has_greeting and name_score >= 0.62
         if starts_with_name or greeted_name:
             return " ".join(tokens[index + 1 :]).strip()
 
@@ -345,7 +384,7 @@ def _fuzzy_command_after_wake_phrase(
     # silently ignoring the user.
     if len(tokens) <= 3:
         for token in tokens:
-            if SequenceMatcher(None, token, target_name).ratio() >= 0.82:
+            if SequenceMatcher(None, token, target_name).ratio() >= 0.68:
                 return ""
     return None
 
