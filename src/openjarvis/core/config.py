@@ -1144,7 +1144,8 @@ class AgentConfig:
         "user's own hardware. You are not a cloud service, and you are not "
         "Claude, ChatGPT, Gemini, OpenJarvis, or any other branded assistant. If asked "
         "who or what you are, identify yourself as Sakura. Respond "
-        "helpfully, concisely, and accurately."
+        "helpfully, concisely, and accurately. Always respond in English "
+        "unless the user explicitly asks for another language."
     )
 
     # Backward-compat property for old field name
@@ -1616,7 +1617,7 @@ class SpeechConfig:
 
     backend: str = "auto"  # "auto", "faster-whisper", "openai", "deepgram"
     model: str = "base"  # Whisper model size: tiny, base, small, medium, large-v3
-    language: str = ""  # Empty = auto-detect
+    language: str = "en"  # Whisper language code; use "" for auto-detect
     device: str = "auto"  # "auto", "cpu", "cuda"
     compute_type: str = "float16"  # "float16", "int8", "float32"
     # Text-to-speech. ``voice_id`` is interpreted by ``tts_backend`` only --
