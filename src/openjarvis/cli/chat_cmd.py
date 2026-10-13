@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 
 import click
@@ -86,6 +88,120 @@ def _startup_greeting(
 def _startup_greeting_enabled() -> bool:
     value = os.environ.get("SAKURA_STARTUP_GREETING", "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
+
+
+def _format_directory_listing(path: str, *, limit: int = 40) -> str:
+    from openjarvis.system_awareness import list_directory
+
+    data = list_directory(path, limit=limit)
+    if not data.get("ok"):
+        return str(data.get("error", "Could not list that directory."))
+    lines = [f"Directory: {data['path']}"]
+    entries = data.get("entries", [])
+    if not entries:
+        lines.append("No visible non-sensitive entries found.")
+    for entry in entries:
+        size = "" if entry["size_bytes"] is None else f" {entry['size_bytes']} bytes"
+        lines.append(
+            f"- {entry['name']} [{entry['kind']}] {entry['permissions']}"
+            f"{size} modified {entry['modified']}"
+        )
+    if data.get("hidden_skipped"):
+        lines.append(f"Hidden entries skipped: {data['hidden_skipped']}")
+    if data.get("sensitive_skipped"):
+        lines.append(f"Sensitive-looking entries skipped: {data['sensitive_skipped']}")
+    if data.get("truncated"):
+        lines.append(f"Showing first {data['shown']} entries only.")
+    return "\n".join(lines)
+
+
+def _local_directory_from_text(text: str) -> str | None:
+    lowered = text.lower().strip()
+    home = Path.home()
+    common = {
+        "desktop": home / "Desktop",
+        "documents": home / "Documents",
+        "downloads": home / "Downloads",
+        "pictures": home / "Pictures",
+        "music": home / "Music",
+        "videos": home / "Videos",
+        "home": home,
+        "current directory": Path.cwd(),
+        "cwd": Path.cwd(),
+    }
+    for name, path in common.items():
+        if name in lowered:
+            return str(path)
+
+    quoted = re.search(r"['\"]([^'\"]+)['\"]", text)
+    if quoted:
+        return quoted.group(1)
+
+    explicit = re.search(r"(?:in|of|under|inside)\s+([~/][^\s]+)", text, re.I)
+    if explicit:
+        return explicit.group(1)
+    return None
+
+
+def _try_local_system_answer(user_input: str) -> str | None:
+    """Answer simple local-awareness questions without sending them to an LLM."""
+    from openjarvis.system_awareness import system_snapshot
+
+    text = user_input.strip()
+    lowered = text.lower()
+
+    if lowered in {"/system", "/sysinfo"}:
+        data = system_snapshot()
+        dirs = ", ".join(
+            f"{item['name']}={'ok' if item['exists'] else 'missing'}"
+            for item in data["common_dirs"]
+        )
+        return (
+            f"User: {data['user']}\n"
+            f"Host: {data['hostname']}\n"
+            f"Time: {data['time']}\n"
+            f"Platform: {data['platform']}\n"
+            f"Home: {data['home']}\n"
+            f"Current directory: {data['cwd']}\n"
+            f"Common directories: {dirs}\n"
+            "Permissions: read-only awareness is local; file contents, writes, "
+            "and shell commands require explicit tools/actions."
+        )
+
+    if lowered.startswith("/ls"):
+        path = text[3:].strip() or "."
+        return _format_directory_listing(path)
+
+    if any(phrase in lowered for phrase in ("what time", "current time", "time is it")):
+        return f"The local time is {datetime.now().astimezone().isoformat(timespec='seconds')}."
+
+    if any(phrase in lowered for phrase in ("system owner", "current user", "who owns this system", "who am i")):
+        data = system_snapshot()
+        return f"The current system user is {data['user']} on host {data['hostname']}."
+
+    if any(phrase in lowered for phrase in ("current directory", "working directory", "where are you running")):
+        data = system_snapshot()
+        return f"Sakura is running from {data['cwd']}."
+
+    wants_listing = any(
+        phrase in lowered
+        for phrase in (
+            "list directory",
+            "list the directory",
+            "directory contents",
+            "contents of",
+            "what is in",
+            "what's in",
+            "show files",
+            "show me files",
+        )
+    )
+    if wants_listing:
+        path = _local_directory_from_text(text)
+        if path is not None:
+            return _format_directory_listing(path)
+
+    return None
 
 
 async def _stream_voice_response(
@@ -599,6 +715,8 @@ def chat(
                 "  /clear        — clear conversation\n"
                 "  /model        — show model info\n"
                 "  /runtime      — Ollama context + GPU offload for this session\n"
+                "  /system       — show local user/time/permission context\n"
+                "  /ls [path]    — list safe directory metadata\n"
                 "  /history      — show conversation\n"
                 "  /help         — this message"
             )
@@ -611,6 +729,24 @@ def chat(
                     role_str = msg.role if isinstance(msg.role, str) else msg.role.value
                     role = role_str.upper()
                     console.print(f"[bold]{role}:[/bold] {msg.content[:200]}")
+            continue
+
+        local_content = _try_local_system_answer(user_input)
+        if local_content is not None:
+            history.append(Message(role=Role.USER, content=user_input))
+            history.append(Message(role=Role.ASSISTANT, content=local_content))
+            console.print()
+            console.print(Markdown(local_content))
+            console.print()
+            if voice_mode:
+                assert voice_session is not None
+                speak(local_content, console, voice_session)
+            publish_completed_exchange(
+                bus,
+                user_input,
+                local_content,
+                source="cli.chat.local_system",
+            )
             continue
 
         # Add user message

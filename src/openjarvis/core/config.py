@@ -2182,7 +2182,7 @@ default_model = "{model}"
 default_agent = "simple"
 
 [tools]
-enabled = ["code_interpreter", "web_search", "file_read", "shell_exec"]
+enabled = ["code_interpreter", "web_search", "file_read", "shell_exec", "system_info", "list_directory"]
 """
 
 

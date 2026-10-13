@@ -158,6 +158,11 @@ except ImportError:
     pass
 
 try:
+    import openjarvis.tools.system_info  # noqa: F401
+except ImportError:
+    pass
+
+try:
     import openjarvis.tools.knowledge_sql  # noqa: F401
 except ImportError:
     pass
