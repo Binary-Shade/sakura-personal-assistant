@@ -171,6 +171,18 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
     """Synthesize and play text, reusing a healthy backend for the session."""
     from openjarvis.speech.voice_io import play_wav
 
+    audio = synthesize_speech(text, console, session)
+    if audio is not None:
+        audio_bytes, sample_rate = audio
+        play_wav(audio_bytes, sample_rate=sample_rate)
+
+
+def synthesize_speech(
+    text: str,
+    console: Any,
+    session: VoiceSession | None = None,
+) -> tuple[bytes, int] | None:
+    """Synthesize text and return WAV bytes without blocking on playback."""
     active_session = session or VoiceSession()
 
     # Resolved before the loop: a bad config value must surface as a config
@@ -179,7 +191,7 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
         active_session.get_voice_preferences()
     except Exception as exc:
         console.print(f"[red]Invalid speech config: {_terminal_safe_text(exc)}[/red]")
-        return
+        return None
 
     while (backend := active_session.get_tts_backend()) is not None:
         try:
@@ -189,8 +201,8 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
                 synth_kwargs["voice_id"] = voice_id
             result = backend.synthesize(text, **synth_kwargs)
             if result.audio:
-                play_wav(result.audio, sample_rate=result.sample_rate)
-            return
+                return result.audio, result.sample_rate
+            return None
         except Exception as exc:
             console.print(
                 f"[dim yellow]Voice backend "
@@ -203,6 +215,7 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
         "[dim yellow]No TTS backend available — install kokoro: "
         "pip install kokoro[/dim yellow]"
     )
+    return None
 
 
 _SENTENCE_BOUNDARY_RE = re.compile(r"([.!?]+[\"')\]]*\s+|\n+)")
@@ -215,10 +228,13 @@ class SpeechChunker:
     def __init__(
         self,
         *,
+        min_sentence_chars: int = 24,
         min_clause_chars: int = 80,
         force_chars: int = 220,
     ) -> None:
         self._buffer = ""
+        self._pending_short = ""
+        self._min_sentence_chars = min_sentence_chars
         self._min_clause_chars = min_clause_chars
         self._force_chars = force_chars
 
@@ -232,7 +248,7 @@ class SpeechChunker:
             if sentence_match is not None:
                 chunk, self._buffer = _split_at_match(self._buffer, sentence_match)
                 if chunk:
-                    chunks.append(chunk)
+                    chunks.extend(self._accept_chunk(chunk, allow_pending=True))
                 continue
 
             if len(self._buffer) >= self._min_clause_chars:
@@ -243,7 +259,7 @@ class SpeechChunker:
                 ):
                     chunk, self._buffer = _split_at_match(self._buffer, clause_match)
                     if chunk:
-                        chunks.append(chunk)
+                        chunks.extend(self._accept_chunk(chunk))
                     continue
 
             if len(self._buffer) >= self._force_chars:
@@ -253,7 +269,7 @@ class SpeechChunker:
                 chunk = self._buffer[:split_at].strip()
                 self._buffer = self._buffer[split_at:].lstrip()
                 if chunk:
-                    chunks.append(chunk)
+                    chunks.extend(self._accept_chunk(chunk))
                 continue
 
             break
@@ -264,7 +280,19 @@ class SpeechChunker:
         """Return any remaining buffered text as the final speech chunk."""
         chunk = self._buffer.strip()
         self._buffer = ""
+        if self._pending_short:
+            chunk = f"{self._pending_short} {chunk}".strip()
+            self._pending_short = ""
         return [chunk] if chunk else []
+
+    def _accept_chunk(self, chunk: str, *, allow_pending: bool = False) -> list[str]:
+        if self._pending_short:
+            chunk = f"{self._pending_short} {chunk}".strip()
+            self._pending_short = ""
+        if allow_pending and len(chunk) < self._min_sentence_chars:
+            self._pending_short = chunk
+            return []
+        return [chunk]
 
 
 def _first_match(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
@@ -282,40 +310,67 @@ class StreamingSpeaker:
     def __init__(self, console: Any, session: VoiceSession) -> None:
         self._console = console
         self._session = session
-        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._text_queue: queue.Queue[str | None] = queue.Queue()
+        self._audio_queue: queue.Queue[tuple[bytes, int] | None] = queue.Queue()
         self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="sakura-streaming-tts",
+        self._synth_thread = threading.Thread(
+            target=self._run_synthesis,
+            name="sakura-streaming-tts-synth",
             daemon=True,
         )
-        self._thread.start()
+        self._play_thread = threading.Thread(
+            target=self._run_playback,
+            name="sakura-streaming-tts-playback",
+            daemon=True,
+        )
+        self._synth_thread.start()
+        self._play_thread.start()
 
     def submit(self, text: str) -> None:
         chunk = text.strip()
         if chunk and not self._stop.is_set():
-            self._queue.put(chunk)
+            self._text_queue.put(chunk)
 
     def close(self, *, wait: bool = True) -> None:
-        self._queue.put(None)
+        self._text_queue.put(None)
         if wait:
-            self._thread.join()
+            self._synth_thread.join()
+            self._play_thread.join()
 
     def cancel(self) -> None:
         self._stop.set()
+        self._drain_queue(self._text_queue)
+        self._drain_queue(self._audio_queue)
+        self._text_queue.put(None)
+        self._audio_queue.put(None)
+
+    @staticmethod
+    def _drain_queue(target: queue.Queue[Any]) -> None:
         try:
             while True:
-                self._queue.get_nowait()
+                target.get_nowait()
         except queue.Empty:
             pass
-        self._queue.put(None)
 
-    def _run(self) -> None:
+    def _run_synthesis(self) -> None:
         while not self._stop.is_set():
-            text = self._queue.get()
+            text = self._text_queue.get()
             if text is None:
+                self._audio_queue.put(None)
                 return
-            speak(text, self._console, self._session)
+            audio = synthesize_speech(text, self._console, self._session)
+            if audio is not None and not self._stop.is_set():
+                self._audio_queue.put(audio)
+
+    def _run_playback(self) -> None:
+        from openjarvis.speech.voice_io import play_wav
+
+        while not self._stop.is_set():
+            audio = self._audio_queue.get()
+            if audio is None:
+                return
+            audio_bytes, sample_rate = audio
+            play_wav(audio_bytes, sample_rate=sample_rate)
 
 
 __all__ = [
@@ -326,4 +381,5 @@ __all__ = [
     "read_voice_input",
     "record_voice",
     "speak",
+    "synthesize_speech",
 ]
