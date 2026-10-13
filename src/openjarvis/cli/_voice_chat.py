@@ -17,6 +17,7 @@ VOICE_EXIT = object()
 DEFAULT_WAKE_PHRASE = "hey sakura"
 DEFAULT_WAKE_IDLE_TIMEOUT_SECONDS = 300.0
 _WAKE_DEBUG_ENV = "SAKURA_WAKE_DEBUG"
+_WAKE_WARNED: set[str] = set()
 
 # Backend selection is shared with the API server and lives in
 # openjarvis.speech._tts_discovery. Importing that at module level would pull
@@ -196,6 +197,10 @@ def listen_for_wake_phrase(
     )
     try:
         while True:
+            if _listen_with_porcupine(console):
+                console.print("[dim cyan]Wake word detected. Listening…[/dim cyan]")
+                return record_voice(console, session)
+
             if _listen_with_openwakeword(console):
                 console.print("[dim cyan]Wake word detected. Listening…[/dim cyan]")
                 return record_voice(console, session)
@@ -245,6 +250,105 @@ def listen_for_wake_phrase(
         return VOICE_EXIT
 
 
+def _wake_engine_enabled(engine_name: str) -> bool:
+    configured = os.environ.get("SAKURA_WAKE_ENGINE", "auto").strip().lower()
+    return configured in ("", "auto", engine_name)
+
+
+def _warn_wake_once(console: Any, key: str, message: str) -> None:
+    if key in _WAKE_WARNED:
+        return
+    _WAKE_WARNED.add(key)
+    console.print(f"[dim yellow]{message}[/dim yellow]")
+
+
+def _listen_with_porcupine(console: Any) -> bool:
+    """Return True when Picovoice Porcupine detects the configured wake word.
+
+    For a custom "hey sakura" wake word, create a Linux .ppn model in the
+    Picovoice Console and set:
+
+      SAKURA_WAKE_ENGINE=porcupine
+      SAKURA_PICOVOICE_ACCESS_KEY=<key>
+      SAKURA_PORCUPINE_KEYWORD_PATH=/path/to/hey_sakura_linux.ppn
+
+    Built-in Porcupine keywords can be tested with SAKURA_PORCUPINE_KEYWORD,
+    but custom wake words are the accurate path for Sakura.
+    """
+    if not _wake_engine_enabled("porcupine"):
+        return False
+
+    access_key = os.environ.get("SAKURA_PICOVOICE_ACCESS_KEY", "").strip()
+    keyword_path = os.environ.get("SAKURA_PORCUPINE_KEYWORD_PATH", "").strip()
+    keyword = os.environ.get("SAKURA_PORCUPINE_KEYWORD", "").strip()
+    if not access_key or not (keyword_path or keyword):
+        if os.environ.get("SAKURA_WAKE_ENGINE", "auto").strip().lower() == "porcupine":
+            _warn_wake_once(
+                console,
+                "porcupine-config",
+                "Porcupine wake mode needs SAKURA_PICOVOICE_ACCESS_KEY and "
+                "SAKURA_PORCUPINE_KEYWORD_PATH for a custom 'hey sakura' model.",
+            )
+        return False
+
+    try:
+        import numpy as np
+        import pvporcupine
+        import sounddevice as sd
+    except ImportError as exc:
+        _warn_wake_once(
+            console,
+            "porcupine-import",
+            "pvporcupine is not installed; falling back to the next wake detector. "
+            f"Original error: {_terminal_safe_text(exc)}",
+        )
+        return False
+
+    sensitivity = float(os.environ.get("SAKURA_PORCUPINE_SENSITIVITY", "0.72"))
+    porcupine = None
+    try:
+        if keyword_path:
+            porcupine = pvporcupine.create(
+                access_key=access_key,
+                keyword_paths=[keyword_path],
+                sensitivities=[sensitivity],
+            )
+        else:
+            porcupine = pvporcupine.create(
+                access_key=access_key,
+                keywords=[keyword],
+                sensitivities=[sensitivity],
+            )
+    except Exception as exc:
+        _warn_wake_once(
+            console,
+            "porcupine-load",
+            "Failed to load Porcupine wake model; falling back to the next "
+            f"wake detector. Original error: {_terminal_safe_text(exc)}",
+        )
+        return False
+
+    try:
+        with sd.RawInputStream(
+            samplerate=porcupine.sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=porcupine.frame_length,
+        ) as stream:
+            while True:
+                raw, _ = stream.read(porcupine.frame_length)
+                pcm = np.frombuffer(bytes(raw), dtype=np.int16)
+                if porcupine.process(pcm) >= 0:
+                    _wake_log(
+                        "porcupine_detected "
+                        f"sensitivity={sensitivity:.2f} "
+                        f"keyword_path={bool(keyword_path)} keyword={keyword!r}"
+                    )
+                    return True
+    finally:
+        porcupine.delete()
+
+
 def _listen_with_openwakeword(console: Any) -> bool:
     """Return True when a configured openWakeWord model fires.
 
@@ -252,8 +356,18 @@ def _listen_with_openwakeword(console: Any) -> bool:
     phrase "hey sakura". Without that model, the caller falls back to STT phrase
     detection so wake mode still works during development.
     """
+    if not _wake_engine_enabled("openwakeword"):
+        return False
+
     model_path = os.environ.get("SAKURA_WAKE_MODEL_PATH", "").strip()
     if not model_path:
+        if os.environ.get("SAKURA_WAKE_ENGINE", "auto").strip().lower() == "openwakeword":
+            _warn_wake_once(
+                console,
+                "openwakeword-config",
+                "openWakeWord wake mode needs SAKURA_WAKE_MODEL_PATH for a "
+                "custom 'hey sakura' model.",
+            )
         return False
 
     try:

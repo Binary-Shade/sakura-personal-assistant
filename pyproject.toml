@@ -111,6 +111,7 @@ voice = [
 ]
 voice-wake = [
     "openwakeword>=0.4",
+    "pvporcupine>=3.0",
     "silero-vad>=5.1",
 ]
 openhands = ["openhands-sdk>=1.0; python_version >= '3.12'"]

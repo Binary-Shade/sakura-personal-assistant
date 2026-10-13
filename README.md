@@ -62,6 +62,22 @@ jarvis gui                      # start the graphical browser interface
 jarvis init --preset <name> --force  # replace config with a starter preset
 ```
 
+### Accurate Wake Word
+
+For the best "hey sakura" wake accuracy, use a custom Picovoice Porcupine
+Linux `.ppn` model and run wake mode through Porcupine:
+
+```bash
+export SAKURA_WAKE_ENGINE=porcupine
+export SAKURA_PICOVOICE_ACCESS_KEY="your-picovoice-access-key"
+export SAKURA_PORCUPINE_KEYWORD_PATH="/path/to/hey_sakura_linux.ppn"
+export SAKURA_PORCUPINE_SENSITIVITY=0.72
+sakura chat --wake --wake-phrase "hey sakura"
+```
+
+If Porcupine is not configured, Sakura falls back to a custom openWakeWord
+model via `SAKURA_WAKE_MODEL_PATH`, then to STT phrase matching.
+
 `jarvis gui` starts the local API server and frontend, then opens the graphical
 chat interface in your default browser. It requires Node.js 22+ and is
 available from a source checkout; packaged desktop installers are available
