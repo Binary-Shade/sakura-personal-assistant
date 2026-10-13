@@ -197,11 +197,11 @@ def listen_for_wake_phrase(
     )
     try:
         while True:
-            if _listen_with_porcupine(console):
+            if _listen_with_openwakeword(console):
                 console.print("[dim cyan]Wake word detected. Listening…[/dim cyan]")
                 return record_voice(console, session)
 
-            if _listen_with_openwakeword(console):
+            if _listen_with_porcupine(console):
                 console.print("[dim cyan]Wake word detected. Listening…[/dim cyan]")
                 return record_voice(console, session)
 
@@ -252,6 +252,8 @@ def listen_for_wake_phrase(
 
 def _wake_engine_enabled(engine_name: str) -> bool:
     configured = os.environ.get("SAKURA_WAKE_ENGINE", "auto").strip().lower()
+    if engine_name == "porcupine":
+        return configured == "porcupine"
     return configured in ("", "auto", engine_name)
 
 
@@ -265,15 +267,14 @@ def _warn_wake_once(console: Any, key: str, message: str) -> None:
 def _listen_with_porcupine(console: Any) -> bool:
     """Return True when Picovoice Porcupine detects the configured wake word.
 
-    For a custom "hey sakura" wake word, create a Linux .ppn model in the
-    Picovoice Console and set:
+    This backend is not used by default because it requires Picovoice licensing.
+    To opt in manually, create a Linux .ppn model in Picovoice Console and set:
 
       SAKURA_WAKE_ENGINE=porcupine
       SAKURA_PICOVOICE_ACCESS_KEY=<key>
       SAKURA_PORCUPINE_KEYWORD_PATH=/path/to/hey_sakura_linux.ppn
 
-    Built-in Porcupine keywords can be tested with SAKURA_PORCUPINE_KEYWORD,
-    but custom wake words are the accurate path for Sakura.
+    Built-in Porcupine keywords can be tested with SAKURA_PORCUPINE_KEYWORD.
     """
     if not _wake_engine_enabled("porcupine"):
         return False
@@ -282,13 +283,12 @@ def _listen_with_porcupine(console: Any) -> bool:
     keyword_path = os.environ.get("SAKURA_PORCUPINE_KEYWORD_PATH", "").strip()
     keyword = os.environ.get("SAKURA_PORCUPINE_KEYWORD", "").strip()
     if not access_key or not (keyword_path or keyword):
-        if os.environ.get("SAKURA_WAKE_ENGINE", "auto").strip().lower() == "porcupine":
-            _warn_wake_once(
-                console,
-                "porcupine-config",
-                "Porcupine wake mode needs SAKURA_PICOVOICE_ACCESS_KEY and "
-                "SAKURA_PORCUPINE_KEYWORD_PATH for a custom 'hey sakura' model.",
-            )
+        _warn_wake_once(
+            console,
+            "porcupine-config",
+            "Porcupine wake mode needs SAKURA_PICOVOICE_ACCESS_KEY and "
+            "SAKURA_PORCUPINE_KEYWORD_PATH.",
+        )
         return False
 
     try:
@@ -382,7 +382,8 @@ def _listen_with_openwakeword(console: Any) -> bool:
         )
         return False
 
-    threshold = float(os.environ.get("SAKURA_WAKE_THRESHOLD", "0.55"))
+    threshold = float(os.environ.get("SAKURA_WAKE_THRESHOLD", "0.42"))
+    debug_scores = os.environ.get(_WAKE_DEBUG_ENV) == "1"
     frame_size = int(os.environ.get("SAKURA_WAKE_FRAME_SIZE", "1280"))
     try:
         model = Model(wakeword_model_paths=[model_path])
@@ -405,7 +406,15 @@ def _listen_with_openwakeword(console: Any) -> bool:
             frame = np.asarray(audio).reshape(-1)
             prediction = model.predict(frame)
             score = max(float(value) for value in prediction.values())
+            if debug_scores and score >= threshold * 0.65:
+                _wake_log(
+                    f"openwakeword_score score={score:.3f} threshold={threshold:.3f}"
+                )
             if score >= threshold:
+                _wake_log(
+                    f"openwakeword_detected score={score:.3f} "
+                    f"threshold={threshold:.3f}"
+                )
                 return True
 
 

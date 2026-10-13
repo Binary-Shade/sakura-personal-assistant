@@ -64,19 +64,36 @@ jarvis init --preset <name> --force  # replace config with a starter preset
 
 ### Accurate Wake Word
 
-For the best "hey sakura" wake accuracy, use a custom Picovoice Porcupine
-Linux `.ppn` model and run wake mode through Porcupine:
+For the best free/local "hey sakura" wake accuracy, train a custom
+openWakeWord model and point Sakura at the generated model file:
 
 ```bash
-export SAKURA_WAKE_ENGINE=porcupine
-export SAKURA_PICOVOICE_ACCESS_KEY="your-picovoice-access-key"
-export SAKURA_PORCUPINE_KEYWORD_PATH="/path/to/hey_sakura_linux.ppn"
-export SAKURA_PORCUPINE_SENSITIVITY=0.72
+export SAKURA_WAKE_ENGINE=openwakeword
+export SAKURA_WAKE_MODEL_PATH="/path/to/hey_sakura.onnx"
+export SAKURA_WAKE_THRESHOLD=0.42
 sakura chat --wake --wake-phrase "hey sakura"
 ```
 
-If Porcupine is not configured, Sakura falls back to a custom openWakeWord
-model via `SAKURA_WAKE_MODEL_PATH`, then to STT phrase matching.
+To tune detection, enable wake debug logs and inspect scores:
+
+```bash
+export SAKURA_WAKE_DEBUG=1
+tail -f ~/.openjarvis/.state/wake.log
+```
+
+If it misses wake words, lower `SAKURA_WAKE_THRESHOLD` slightly. If it wakes
+by accident, raise it. Sakura only uses Picovoice Porcupine when explicitly
+requested with `SAKURA_WAKE_ENGINE=porcupine`.
+
+To build a custom training set, record both positive and negative clips:
+
+```bash
+sakura wake record-samples --kind positive --count 75 --phrase "hey sakura"
+sakura wake record-samples --kind negative --count 75
+```
+
+Samples are saved under `~/.openjarvis/wake_samples/` for openWakeWord
+training.
 
 `jarvis gui` starts the local API server and frontend, then opens the graphical
 chat interface in your default browser. It requires Node.js 22+ and is

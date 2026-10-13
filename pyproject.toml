@@ -111,8 +111,10 @@ voice = [
 ]
 voice-wake = [
     "openwakeword>=0.4",
-    "pvporcupine>=3.0",
     "silero-vad>=5.1",
+]
+voice-wake-porcupine = [
+    "pvporcupine>=3.0",
 ]
 openhands = ["openhands-sdk>=1.0; python_version >= '3.12'"]
 # Apple Foundation Models (on-device AFM 3). Needs an Apple Silicon Mac on
