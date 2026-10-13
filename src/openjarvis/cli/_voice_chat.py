@@ -49,6 +49,7 @@ class VoiceSession:
         self._tts_attempted: set[str] = set()
         self._voice_prefs: tuple[str, str, float] | None = None
         self._voice_warned: set[str] = set()
+        self._tts_warmup_started = False
 
     def get_stt_backend(self) -> Any:
         """Resolve and health-check STT once, then reuse the loaded backend."""
@@ -110,6 +111,26 @@ class VoiceSession:
     def discard_tts_backend(self) -> None:
         """Forget a backend that failed synthesis and allow the next fallback."""
         self._tts_backend = None
+
+    def prewarm_tts(self, console: Any) -> None:
+        """Start loading the configured TTS model before the first response."""
+        if self._tts_warmup_started:
+            return
+        self._tts_warmup_started = True
+
+        def _warm() -> None:
+            try:
+                synthesize_speech("Ready.", console, self)
+            except Exception:
+                # Warmup is only an optimization; real synthesis still reports
+                # backend failures when the user needs audio.
+                pass
+
+        threading.Thread(
+            target=_warm,
+            name="sakura-tts-warmup",
+            daemon=True,
+        ).start()
 
 
 def read_voice_input(console: Any, session: VoiceSession) -> Optional[str] | object:
@@ -228,12 +249,15 @@ class SpeechChunker:
     def __init__(
         self,
         *,
+        first_chunk_chars: int = 48,
         min_sentence_chars: int = 24,
         min_clause_chars: int = 80,
         force_chars: int = 220,
     ) -> None:
         self._buffer = ""
         self._pending_short = ""
+        self._emitted_any = False
+        self._first_chunk_chars = first_chunk_chars
         self._min_sentence_chars = min_sentence_chars
         self._min_clause_chars = min_clause_chars
         self._force_chars = force_chars
@@ -261,6 +285,16 @@ class SpeechChunker:
                     if chunk:
                         chunks.extend(self._accept_chunk(chunk))
                     continue
+
+            if not self._emitted_any and len(self._buffer) >= self._first_chunk_chars:
+                split_at = self._buffer.rfind(" ", 0, self._first_chunk_chars)
+                if split_at < self._min_sentence_chars:
+                    split_at = self._first_chunk_chars
+                chunk = self._buffer[:split_at].strip()
+                self._buffer = self._buffer[split_at:].lstrip()
+                if chunk:
+                    chunks.extend(self._accept_chunk(chunk))
+                continue
 
             if len(self._buffer) >= self._force_chars:
                 split_at = self._buffer.rfind(" ", 0, self._force_chars)
@@ -292,6 +326,7 @@ class SpeechChunker:
         if allow_pending and len(chunk) < self._min_sentence_chars:
             self._pending_short = chunk
             return []
+        self._emitted_any = True
         return [chunk]
 
 
