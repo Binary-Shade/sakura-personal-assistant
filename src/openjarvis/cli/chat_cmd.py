@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from typing import List, Optional
@@ -13,7 +14,14 @@ from rich.markup import escape
 
 from openjarvis.cli._runtime_panel import runtime_cli_options
 from openjarvis.cli._tool_names import resolve_tool_names
-from openjarvis.cli._voice_chat import VOICE_EXIT, VoiceSession, read_voice_input, speak
+from openjarvis.cli._voice_chat import (
+    VOICE_EXIT,
+    SpeechChunker,
+    StreamingSpeaker,
+    VoiceSession,
+    read_voice_input,
+    speak,
+)
 from openjarvis.core.config import load_config
 from openjarvis.core.events import EventBus
 from openjarvis.core.types import Message, Role
@@ -35,6 +43,58 @@ def _read_input(prompt: str = "You> ") -> Optional[str]:
         return input(prompt)
     except (EOFError, KeyboardInterrupt):
         return None
+
+
+async def _stream_voice_response(
+    *,
+    console: Console,
+    engine: object,
+    messages: List[Message],
+    model: str,
+    engine_kwargs: dict,
+    voice_session: VoiceSession,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    """Stream text to the terminal and TTS chunks to a background speaker."""
+    chunker = SpeechChunker()
+    speaker = StreamingSpeaker(console, voice_session)
+    content_parts: list[str] = []
+
+    stream_kwargs = dict(engine_kwargs)
+    if temperature is not None:
+        stream_kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        stream_kwargs["max_tokens"] = max_tokens
+
+    try:
+        stream = getattr(engine, "stream")
+        async for token in stream(messages, model=model, **stream_kwargs):
+            if not token:
+                continue
+            content_parts.append(token)
+            console.print(escape(token), end="")
+            for speech_chunk in chunker.feed(token):
+                speaker.submit(speech_chunk)
+
+        for speech_chunk in chunker.flush():
+            speaker.submit(speech_chunk)
+        speaker.close(wait=True)
+        return "".join(content_parts)
+    except BaseException:
+        speaker.cancel()
+        raise
+
+
+def _can_stream_voice_response(agent: object | None) -> bool:
+    """Voice streaming is safe for direct chat and the simple no-tools agent."""
+    if agent is None:
+        return True
+    return getattr(agent, "agent_id", "") == "simple" and not getattr(
+        agent,
+        "accepts_tools",
+        False,
+    )
 
 
 @click.command()
@@ -465,7 +525,63 @@ def chat(
 
         # Generate response even when optional memory context is unavailable.
         try:
-            if agent is not None:
+            streamed_voice = (
+                voice_mode
+                and voice_session is not None
+                and _can_stream_voice_response(agent)
+            )
+            if streamed_voice:
+                console.print()
+                if agent is not None:
+                    from openjarvis.agents._stubs import AgentContext
+
+                    agent_context = AgentContext()
+                    if agent_context_message is not None:
+                        agent_context.conversation.add(agent_context_message)
+                    for msg in history[:-1]:
+                        if msg.role != Role.SYSTEM:
+                            agent_context.conversation.add(msg)
+
+                    emit_start = getattr(agent, "_emit_turn_start", None)
+                    if callable(emit_start):
+                        emit_start(user_input)
+                    messages = agent._build_messages(
+                        user_input,
+                        context=agent_context,
+                    )
+                    agent_engine_kwargs = {
+                        key: value
+                        for key, value in getattr(agent, "_engine_options", {}).items()
+                        if key in {"num_ctx", "num_gpu"}
+                    }
+                    content = asyncio.run(
+                        _stream_voice_response(
+                            console=console,
+                            engine=getattr(agent, "_engine"),
+                            messages=messages,
+                            model=getattr(agent, "_model"),
+                            engine_kwargs=agent_engine_kwargs,
+                            voice_session=voice_session,
+                            temperature=getattr(agent, "_temperature", None),
+                            max_tokens=getattr(agent, "_max_tokens", None),
+                        )
+                    )
+                    emit_end = getattr(agent, "_emit_turn_end", None)
+                    if callable(emit_end):
+                        emit_end(content_length=len(content))
+                else:
+                    content = asyncio.run(
+                        _stream_voice_response(
+                            console=console,
+                            engine=engine,
+                            messages=generation_history,
+                            model=model,
+                            engine_kwargs=engine_kwargs,
+                            voice_session=voice_session,
+                        )
+                    )
+                console.print("\n")
+            elif agent is not None:
                 from openjarvis.agents._stubs import AgentContext
 
                 agent_context = AgentContext()
@@ -491,10 +607,11 @@ def chat(
                 )
 
             history.append(Message(role=Role.ASSISTANT, content=content))
-            console.print()
-            console.print(Markdown(content))
-            console.print()
-            if voice_mode:
+            if not streamed_voice:
+                console.print()
+                console.print(Markdown(content))
+                console.print()
+            if voice_mode and not streamed_voice:
                 assert voice_session is not None
                 speak(content, console, voice_session)
 

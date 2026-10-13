@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import queue
+import re
+import threading
 from typing import Any, Optional
 
 from rich.markup import escape
@@ -202,4 +205,125 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
     )
 
 
-__all__ = ["VOICE_EXIT", "VoiceSession", "read_voice_input", "record_voice", "speak"]
+_SENTENCE_BOUNDARY_RE = re.compile(r"([.!?]+[\"')\]]*\s+|\n+)")
+_CLAUSE_BOUNDARY_RE = re.compile(r"([,;:][\"')\]]*\s+)")
+
+
+class SpeechChunker:
+    """Incrementally split streamed model text into TTS-friendly chunks."""
+
+    def __init__(
+        self,
+        *,
+        min_clause_chars: int = 80,
+        force_chars: int = 220,
+    ) -> None:
+        self._buffer = ""
+        self._min_clause_chars = min_clause_chars
+        self._force_chars = force_chars
+
+    def feed(self, text: str) -> list[str]:
+        """Return speakable chunks completed by this token fragment."""
+        self._buffer += text
+        chunks: list[str] = []
+
+        while True:
+            sentence_match = _first_match(_SENTENCE_BOUNDARY_RE, self._buffer)
+            if sentence_match is not None:
+                chunk, self._buffer = _split_at_match(self._buffer, sentence_match)
+                if chunk:
+                    chunks.append(chunk)
+                continue
+
+            if len(self._buffer) >= self._min_clause_chars:
+                clause_match = _first_match(_CLAUSE_BOUNDARY_RE, self._buffer)
+                if (
+                    clause_match is not None
+                    and clause_match.end() >= self._min_clause_chars
+                ):
+                    chunk, self._buffer = _split_at_match(self._buffer, clause_match)
+                    if chunk:
+                        chunks.append(chunk)
+                    continue
+
+            if len(self._buffer) >= self._force_chars:
+                split_at = self._buffer.rfind(" ", 0, self._force_chars)
+                if split_at < self._min_clause_chars:
+                    split_at = self._force_chars
+                chunk = self._buffer[:split_at].strip()
+                self._buffer = self._buffer[split_at:].lstrip()
+                if chunk:
+                    chunks.append(chunk)
+                continue
+
+            break
+
+        return chunks
+
+    def flush(self) -> list[str]:
+        """Return any remaining buffered text as the final speech chunk."""
+        chunk = self._buffer.strip()
+        self._buffer = ""
+        return [chunk] if chunk else []
+
+
+def _first_match(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    return next(pattern.finditer(text), None)
+
+
+def _split_at_match(text: str, match: re.Match[str]) -> tuple[str, str]:
+    end = match.end()
+    return text[:end].strip(), text[end:].lstrip()
+
+
+class StreamingSpeaker:
+    """Synthesize and play TTS chunks in order while text is still streaming."""
+
+    def __init__(self, console: Any, session: VoiceSession) -> None:
+        self._console = console
+        self._session = session
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="sakura-streaming-tts",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, text: str) -> None:
+        chunk = text.strip()
+        if chunk and not self._stop.is_set():
+            self._queue.put(chunk)
+
+    def close(self, *, wait: bool = True) -> None:
+        self._queue.put(None)
+        if wait:
+            self._thread.join()
+
+    def cancel(self) -> None:
+        self._stop.set()
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            text = self._queue.get()
+            if text is None:
+                return
+            speak(text, self._console, self._session)
+
+
+__all__ = [
+    "VOICE_EXIT",
+    "SpeechChunker",
+    "StreamingSpeaker",
+    "VoiceSession",
+    "read_voice_input",
+    "record_voice",
+    "speak",
+]
